@@ -1,0 +1,13 @@
+librosa
+noisereduce
+scipy
+pyloudnorm
+fastapi
+pydantic
+soundfile
+openai-whisper
+TTS==0.22.0
+transformers==4.36.2
+numpy==1.22.0
+uvicorn
+python-multipart

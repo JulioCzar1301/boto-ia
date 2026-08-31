@@ -1,0 +1,19 @@
+services:
+  api:
+    build: .
+    container_name: boto_tts
+    restart: always
+    ports:
+      - "8002:8002"
+    environment:
+      - COQUI_TOS_AGREED=1
+    volumes:
+      - ./embeddings:/app/embeddings
+      - ./voices:/app/voices
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
