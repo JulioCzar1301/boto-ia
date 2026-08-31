@@ -1,0 +1,104 @@
+@startuml sequence
+title Fluxo de Detecção com Fusão: POST /detection/fused
+
+actor Client as C
+participant "main.py\n(FastAPI)" as API
+participant "utils/image.py" as IMG
+participant "utils/geometry.py" as GEO
+participant "services/qwen.py" as QWEN
+participant "vLLM Server\n(Qwen2.5-14B)" as VLLM
+participant "services/yoloe.py" as YOLOE
+participant "services/fusion.py" as FUSION
+
+C ->> API: POST /detection/fused\n{image: base64}
+activate API
+
+API ->> IMG: resize_base64_image(image)
+IMG -->> API: image_b64 redimensionada
+
+API ->> IMG: b64_to_pil(image_b64)
+IMG -->> API: img: PIL.Image
+
+== Etapa 1 — Paralelo ==
+
+par Execução paralela (asyncio.gather)
+    API ->> QWEN: call_qwen(client, image_b64, SYSTEM_INSTRUCTION)
+    QWEN ->> VLLM: POST /v1/chat/completions\n(imagem + system prompt)
+    VLLM -->> QWEN: choices[0].message.content (JSON)
+    QWEN -->> API: vllm_response
+else
+    API ->> YOLOE: run_yoloe(img)\n[executor thread]
+    YOLOE -->> API: yoloe_objects: List[DetectedObject]
+end
+
+API ->> QWEN: parse_qwen_response(vllm_response, img_size)
+QWEN -->> API: qwen_objects: List[DetectedObject]
+
+== Etapa 2 — Filtro de Foreground ==
+
+API ->> GEO: is_foreground(obj) para cada objeto
+note over GEO
+  Remove: área < 1.5% (ruído)
+  Remove: área > 75% (fundo)
+  Remove: pequeno + periférico
+end note
+GEO -->> API: qwen_filtered, yoloe_filtered
+
+== Etapa 3 — Fusão IoU ==
+
+API ->> FUSION: fuse_by_iou(qwen_filtered, yoloe_filtered, threshold=0.15)
+activate FUSION
+loop Para cada qwen_object
+    FUSION ->> FUSION: calcula IoU com cada yoloe_bbox
+    alt IoU >= 0.15 e não usado
+        FUSION ->> FUSION: source="fused"\nlabel+score Qwen + bbox YOLOE
+    else IoU < 0.15
+        FUSION ->> FUSION: mantém objeto Qwen\nsource="qwen"
+    end
+end
+FUSION -->> API: fused: List[DetectedObject]
+deactivate FUSION
+
+== Etapa 4 — Verificação de Crop (paralelo) ==
+
+par call_verify em paralelo para cada objeto
+    API ->> GEO: crop_object(img, bbox)
+    GEO -->> API: crop: PIL.Image
+    API ->> IMG: pil_to_b64(crop)
+    IMG -->> API: crop_b64
+    API ->> QWEN: call_verify(client, crop_b64, hint_label)
+    QWEN ->> VLLM: POST /v1/chat/completions\n(crop + VERIFY_INSTRUCTION)
+    VLLM -->> QWEN: {"label": ..., "score": ...}
+    QWEN -->> API: verify_response
+    API ->> QWEN: parse_verify_response(verify_response)
+    QWEN -->> API: (label, score)
+    alt score >= 0.6
+        API ->> API: adiciona objeto verificado
+    else score < 0.6
+        API ->> API: descarta objeto
+    end
+end
+
+== Etapa 5 — Remoção de Sub-partes ==
+
+API ->> GEO: remove_subparts(verified)
+note over GEO
+  containment(A em B) > 60%
+  e area(A) < area(B) → descarta A
+  Ex: "teclado" dentro de "notebook"
+end note
+GEO -->> API: verified sem sub-partes
+
+== Etapa 6 — Ranking Final ==
+
+API ->> GEO: centrality(bbox) para cada objeto
+GEO -->> API: scores de centralidade
+API ->> API: ordena por score × (0.6 + 0.4 × centralidade)\n→ top 5
+
+API ->> FUSION: serialize_detections(final)
+FUSION -->> API: dict com "objects" e "too_many_objects"
+
+API -->> C: HTTP 200\n{objects: [...], too_many_objects: false}
+deactivate API
+
+@enduml
